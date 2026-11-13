@@ -13,3 +13,4 @@ web-ext-artifacts/
 # working notes, listing drafts, review material -- not part of the
 # published repository. README.md and assets/ are, and stay tracked.
 docs/
+.DS_Store

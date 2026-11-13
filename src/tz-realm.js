@@ -922,16 +922,29 @@ function installTZRealm (CFG, SELF) {
        * `file instanceof Blob`, because File.prototype's chain reaches the
        * *native* Blob.prototype.) */
 
-      // 1. Record JS blob bodies as they are constructed, so that
-      //    Worker(blob:) can be rewritten synchronously — no XHR, no await,
-      //    no race. This is what makes inline workers patchable at all.
+      // 1. Inject the realm payload into JS blob bodies AT CONSTRUCTION, and
+      //    record what went in. This is what makes inline workers patchable
+      //    without ever substituting the page's blob: URL.
+      //
+      //    Why here and not in the Worker constructor: Cloudflare Turnstile
+      //    binds its challenge worker to the exact blob: URL it created.
+      //    Handing Worker() a DIFFERENT blob: URL — even one whose code is
+      //    byte-identical — makes the widget stop silently: no token, no
+      //    error, "Turnstile Widget seem to have crashed" a minute later.
+      //    Verified against a live widget: substituting the URL fails,
+      //    prepending here passes with the worker realm still spoofed.
+      //    The page keeps the one URL it made, so every self-reference and
+      //    integrity check it performs still lines up.
+      let workerPayload = null;
+      const payloadOnce = () =>
+        workerPayload || (workerPayload = makePayload(CFG) + '/*__bhtz__*/\n');
       try {
         function FakeBlob(parts, options) {
           if (new.target === undefined) {
             throw new realm.TypeError(
               "Failed to construct 'Blob': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
           }
-          const blob = Reflect.construct(NativeBlob, arguments, new.target);
+          let body = null;
           try {
             if (isJsType(options && options.type) && parts != null) {
               let text = '';
@@ -939,9 +952,15 @@ function installTZRealm (CFG, SELF) {
                 if (typeof p !== 'string') { text = null; break; }
                 text += p;
               }
-              if (text !== null) jsBlobSources.set(blob, text);
+              // Already carries a payload (nested worker built from our own
+              // source): keep it verbatim, never stack a second copy.
+              if (text !== null) body = text.indexOf('/*__bhtz__*/') === -1 ? payloadOnce() + text : text;
             }
           } catch (_) {}
+          const blob = body === null
+            ? Reflect.construct(NativeBlob, arguments, new.target)
+            : Reflect.construct(NativeBlob, [[body], options], new.target);
+          try { if (body !== null) jsBlobSources.set(blob, body); } catch (_) {}
           return blob;
         }
         def(FakeBlob, 'name', 'Blob');
