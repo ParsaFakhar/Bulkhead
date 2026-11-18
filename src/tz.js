@@ -60,11 +60,18 @@
 
   let enabled = true
   let reloadOnChange = false
-  /** @type {Record<string, string>} zone string, or 'off' */
+  /** @type {Record<string, string>} mode keyword ('off'|'bulkhead'|'exit') or a pinned zone */
   let overrides = Object.create(null)
+  /** @type {Record<string, boolean>} per-context "a downstream proxy (FoxyProxy) is ON" */
+  let foxy = Object.create(null)
   /** @type {boolean | null} null = untested, true/false = world:'MAIN' registration capability */
   let mainWorldOk = null
   let lastError = ''
+  /** Supplies the page-path exit geo for a context (background owns the lookup).
+   *  @type {(id: string) => { country: string | null, city: string | null } | null} */
+  let pageGeoSource = () => null
+  /** @param {(id: string) => { country: string | null, city: string | null } | null} fn */
+  function setPageGeoSource (fn) { if (typeof fn === 'function') pageGeoSource = fn }
 
   /* ---------------------------------------------------------------- storage */
 
@@ -76,11 +83,13 @@
   let settingsReady = null
 
   async function loadSettings () {
-    const s = await browser.storage.local.get(['tzEnabled', 'tzOverrides', 'tzReload'])
+    const s = await browser.storage.local.get(['tzEnabled', 'tzOverrides', 'tzReload', 'tzFoxy'])
     enabled = s.tzEnabled !== false
     reloadOnChange = s.tzReload === true
     const ov = s.tzOverrides
     overrides = ov && typeof ov === 'object' ? ov : Object.create(null)
+    const fx = s.tzFoxy
+    foxy = fx && typeof fx === 'object' ? fx : Object.create(null)
   }
 
   /** @returns {Promise<void>} */
@@ -203,9 +212,14 @@
         enabled,
         override: Object.prototype.hasOwnProperty.call(overrides, id) ? overrides[id] : null,
         geo: config ? config.lastGeo || null : null,
-        // Probe geography is only trustworthy while the probe verdict stands:
-        // it described the exit that was verified 'up'.
-        geoTrusted: Boolean(config && config.health === 'up' && config.lastGeo),
+        // Exit-mode geography is the OBSERVED exit, trusted once the probe's
+        // route was verified — independent of the Mullvad-only health verdict,
+        // so a real non-Mullvad exit still gets its zone matched even though the
+        // gate blocks it. (lastGeoVerified is set by setGeo only on a verified
+        // route; it replaces the old health==='up' gate on geography.)
+        geoTrusted: Boolean(config && config.lastGeo && config.lastGeoVerified),
+        // Downstream-proxy exit, measured through the container's page path.
+        foxyGeo: foxy[id] === true ? (pageGeoSource(id) || null) : null,
         config: config || null,
         intl: Intl
       })
@@ -366,69 +380,102 @@
 
   /**
    * Source for browser.tabs.executeScript (ISOLATED world) behind the popup's
-   * Verify button. Reads the page realm through wrappedJSObject — the Xray
-   * view of exactly the objects the page itself sees — and reproduces
-   * CreepJS's own derivations, so the verdict is about what a fingerprinter
-   * measures, not about what we intended to install.
+   * Verify button. The measurements themselves run IN THE PAGE REALM, reached
+   * through window.wrappedJSObject.eval, and reproduce CreepJS's own
+   * derivations — so the verdict is about what a fingerprinter measures, not
+   * about what we intended to install.
+   *
+   * WHY NOT READ THROUGH XRAY FROM HERE (the old approach, and its two false
+   * alarms):
+   *   - Xray wrappers expose the ORIGINAL native DOM methods, bypassing the
+   *     page's overrides. An iframe created from the isolated world therefore
+   *     never triggers the engine's insertion-time realm capture, so the probe
+   *     frame read as unpatched — the old "about:blank probe realm: error".
+   *   - Xray's view of Date/Intl can diverge from the page's own patched
+   *     values, so comparing a getter read through Xray against an Intl value
+   *     read through Xray reported a disagreement the page itself never had —
+   *     the old false "local getters vs Intl: DISAGREE" on a realm CreepJS
+   *     passed clean.
+   * Running the probe in the page realm measures exactly what the page (and
+   * CreepJS) sees, with every patch active. The result is returned as a JSON
+   * string, which crosses back through Xray as a plain primitive.
+   *
+   * The hour check reads formatToParts and normalises 24 -> 0: some ICU builds
+   * render midnight as "24" even under hourCycle:'h23', which would otherwise
+   * disagree with getHours()'s 0 at exactly that hour.
+   *
+   * If the page's CSP forbids eval (no 'unsafe-eval'), the in-page probe cannot
+   * run; that is reported honestly rather than as a false inconsistency. The
+   * timezone patch itself is unaffected — it is a MAIN-world content script,
+   * which is CSP-exempt.
    * @returns {string}
    */
   function verifySource () {
-    return `(function () {
+    // Self-contained page-realm probe. No reference to anything outside the
+    // page global; returns a JSON string of every observable CreepJS derives.
+    const probe = `(function () {
   'use strict';
-  var out = { ok: false };
+  var R = { ok: true };
   try {
-    var w = window.wrappedJSObject;
-    if (!w) { out.error = 'no page realm from here'; return out; }
-    var D = w.Date;
-    var now = new D();
-    out.ok = true;
-    out.url = location.href;
-    out.tz = new w.Intl.DateTimeFormat().resolvedOptions().timeZone;
-    out.dateToString = String(now);
-    out.offset = now.getTimezoneOffset();
+    R.url = location.href;
+    var now = new Date();
+    R.tz = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+    R.dateToString = String(now);
+    R.offset = now.getTimezoneOffset();
     // CreepJS getTimezoneOffset(): local-string parse minus UTC parse.
     try {
       var p = JSON.stringify(now).slice(1, 11).split('-');
-      var y = p[0], m = p[1], d = p[2];
-      out.offsetComputed = ~~((+new D(m + '/' + d + '/' + y) - +new D(y + '-' + m + '-' + d)) / 60000);
-    } catch (e) { out.offsetComputed = null; }
+      R.offsetComputed = ~~((+new Date(p[1] + '/' + p[2] + '/' + p[0]) - +new Date(p[0] + '-' + p[1] + '-' + p[2])) / 60000);
+    } catch (e) { R.offsetComputed = null; }
     // CreepJS decryptLocation(): year-1113 LMT, system vs resolvedOptions.
     try {
-      var tzName = out.tz;
-      var f = new w.Intl.DateTimeFormat('en', {
-        timeZone: tzName, year: 'numeric', month: 'numeric', day: 'numeric',
+      var f = new Intl.DateTimeFormat('en', {
+        timeZone: R.tz, year: 'numeric', month: 'numeric', day: 'numeric',
         hour: 'numeric', minute: 'numeric', second: 'numeric'
       });
-      var utcAnchor = +new D('1113-07-01');
-      var system = (+new D('7/1/1113') - utcAnchor) / 60000;
-      var resolved = (+new D(f.format(new D('7/1/1113'))) - utcAnchor) / 60000;
-      out.lmtSystem = system;
-      out.lmtResolved = resolved;
-      out.lmtMatch = system === resolved;
-    } catch (e) { out.lmtMatch = null; }
-    // Internal consistency: local getters must agree with Intl for one instant.
+      var anchor = +new Date('1113-07-01');
+      R.lmtSystem = (+new Date('7/1/1113') - anchor) / 60000;
+      R.lmtResolved = (+new Date(f.format(new Date('7/1/1113'))) - anchor) / 60000;
+      R.lmtMatch = R.lmtSystem === R.lmtResolved;
+    } catch (e) { R.lmtMatch = null; }
+    // Internal consistency: local getters vs Intl for one instant. Read the
+    // hour from formatToParts and normalise 24 -> 0 (ICU midnight quirk).
     try {
-      out.gettersAgree = now.getHours() ===
-        +new w.Intl.DateTimeFormat('en-US', { hour: '2-digit', hourCycle: 'h23' }).format(now);
-    } catch (e) { out.gettersAgree = null; }
-    // Probe realm: a fresh about:blank iframe, the way CreepJS inspects lies.
+      var hp = new Intl.DateTimeFormat('en-US', { hour: '2-digit', hourCycle: 'h23' }).formatToParts(now);
+      var h = NaN;
+      for (var i = 0; i < hp.length; i++) { if (hp[i].type === 'hour') { h = (+hp[i].value) % 24; break; } }
+      R.gettersAgree = now.getHours() === h;
+    } catch (e) { R.gettersAgree = null; }
+    // Probe realm: a fresh about:blank iframe created IN THE PAGE REALM, so the
+    // engine's insertion-time capture patches it exactly as CreepJS's own
+    // probe frame is patched.
     try {
       var fr = document.createElement('iframe');
       fr.style.display = 'none';
       (document.body || document.documentElement).appendChild(fr);
-      out.iframeTz = new fr.contentWindow.Intl.DateTimeFormat().resolvedOptions().timeZone;
-      out.iframeOffset = new fr.contentWindow.Date().getTimezoneOffset();
+      var cw = fr.contentWindow;
+      R.iframeTz = new cw.Intl.DateTimeFormat().resolvedOptions().timeZone;
+      R.iframeOffset = new cw.Date().getTimezoneOffset();
       fr.remove();
-    } catch (e) { out.iframeTz = null; }
+    } catch (e) { R.iframeTz = null; }
     // The engine's own stamp.
-    try {
-      var st = w.__bhtz;
-      out.stamp = st ? { zone: st.zone, late: st.late } : null;
-    } catch (e) { out.stamp = null; }
+    try { var st = window.__bhtz; R.stamp = st ? { zone: st.zone, late: st.late } : null; } catch (e) { R.stamp = null; }
   } catch (e) {
-    out.error = String((e && e.message) || e);
+    R.ok = false;
+    R.error = String((e && e.message) || e);
   }
-  return out;
+  return JSON.stringify(R);
+})()`
+    return `(function () {
+  'use strict';
+  try {
+    var w = window.wrappedJSObject;
+    if (!w) return { ok: false, error: 'no page realm from here' };
+    if (typeof w.eval !== 'function') return { ok: false, error: 'page realm eval unavailable' };
+    return JSON.parse(w.eval(${JSON.stringify(probe)}));
+  } catch (e) {
+    return { ok: false, error: 'in-page verifier blocked (likely page CSP without unsafe-eval): ' + String((e && e.message) || e) };
+  }
 })();`
   }
 

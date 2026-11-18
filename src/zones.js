@@ -205,9 +205,11 @@
 
   // Zone sources, surfaced in the UI. `probe` is the normal steady state: the
   // killswitch's own health check, riding the container's own exit, said where
-  // that exit is. It can only exist while health is 'up' — and because the
-  // gate blocks everything until then, no page ever loads on a weaker source.
-  /** @typedef {'pin' | 'probe' | 'relay' | 'off' | 'disabled' | 'unmanaged' | 'unknown'} TzSource */
+  // that exit is. `page` is the real exit measured through the container's
+  // actual page path (a downstream proxy such as FoxyProxy + residential), used
+  // when the user says a downstream proxy is ON. `bulkhead` is the assigned
+  // server's listed location, chosen explicitly to ignore the real exit.
+  /** @typedef {'pin' | 'probe' | 'page' | 'relay' | 'bulkhead' | 'off' | 'disabled' | 'unmanaged' | 'unknown'} TzSource */
 
   /**
    * Decide what zone (if any) a context should present, and why. Pure: the
@@ -217,21 +219,25 @@
    *   override 'off'   the user said: never spoof here.
    *   override zone    a pin. Standing instruction, no lookup, no expiry.
    *   global disabled  the feature is off; nothing spoofs anywhere.
-   *   unmanaged        no exit assigned — there is nothing to match to, and
-   *                    spoofing a zone your real IP contradicts is a louder
-   *                    signal than an honest one.
-   *   probe geo        the verified exit's own country/city (health 'up').
-   *   relay geo        the assigned server's listed city/country. Weaker: it
-   *                    describes the CONFIG, not the observed exit. Only ever
-   *                    briefly relevant — the gate blocks until a probe
-   *                    succeeds — but it means a pin-free container has the
-   *                    right zone registered before its first allowed load.
+   *   override 'bulkhead'  match the ASSIGNED server's listed location only,
+   *                    deliberately ignoring the real exit. No assignment =>
+   *                    nothing to match.
+   *   exit mode (default / 'exit') — match the REAL exit, in evidence order:
+   *     page geo     the exit measured through the container's actual page path
+   *                  (downstream proxy ON). The strongest statement of where
+   *                  pages really surface, so it wins even over the probe, and
+   *                  it applies even to contexts Bulkhead does not manage.
+   *     probe geo    the exit the health probe observed (route-verified).
+   *     relay geo    the assigned server's listed city/country. Weakest: it
+   *                  describes the CONFIG, not the observed exit; only relevant
+   *                  before the first probe answers.
    *
    * @param {{
    *   enabled: boolean,
    *   override?: string | null,
    *   geo?: { country?: string | null, city?: string | null } | null,
    *   geoTrusted?: boolean,
+   *   foxyGeo?: { country?: string | null, city?: string | null } | null,
    *   config?: { city?: string, country?: string, cc?: string } | null,
    *   intl: typeof Intl
    * }} input
@@ -240,35 +246,60 @@
   function derive (input) {
     /** @param {TzSource} source @param {string} [rule] */
     const none = (source, rule = '') => ({ zone: null, source, approx: false, rule })
+    /** @param {{ country?: string | null, city?: string | null }} loc @param {TzSource} source */
+    const from = (loc, source) => {
+      const d = zoneFromLocation({ country: loc.country, city: loc.city })
+      if (d.zone && usableZone(d.zone, input.intl)) return { zone: d.zone, source, approx: d.approx, rule: d.rule }
+      return null
+    }
+    const hasConfigGeo = Boolean(input.config && (input.config.city || input.config.cc || input.config.country))
+    const configGeo = () => {
+      const d = zoneFromLocation({ country: input.config.country, city: input.config.city, cc: input.config.cc })
+      if (d.zone && usableZone(d.zone, input.intl)) return { zone: d.zone, approx: d.approx, rule: d.rule }
+      return null
+    }
 
-    if (input.override === 'off') return none('off', 'spoofing switched off for this context')
-    if (typeof input.override === 'string' && input.override) {
-      const z = canonicalZone(input.override, input.intl)
-      // An unusable pin is treated as absent rather than injected raw: a
-      // hand-edited typo must not leave the container unprotected, and the
-      // UI validates before storing, so this is belt and braces.
+    const ov = input.override
+    if (ov === 'off') return none('off', 'spoofing switched off for this context')
+    // A pin is any zone string that is not a mode keyword. An unusable pin is
+    // treated as absent rather than injected raw: a hand-edited typo must not
+    // leave the container unprotected, and the UI validates before storing.
+    if (typeof ov === 'string' && ov && ov !== 'bulkhead' && ov !== 'exit') {
+      const z = canonicalZone(ov, input.intl)
       if (z) return { zone: z, source: 'pin', approx: false, rule: 'user pin' }
     }
     if (!input.enabled) return none('disabled', 'timezone matching is switched off')
-    if (!input.config) return none('unmanaged', 'no exit assigned to this context')
 
+    // Explicit "match the Bulkhead server" mode: the assignment's listed
+    // location, ignoring whatever exit the traffic actually uses.
+    if (ov === 'bulkhead') {
+      if (hasConfigGeo) {
+        const d = configGeo()
+        if (d) return { zone: d.zone, source: 'bulkhead', approx: d.approx, rule: d.rule }
+      }
+      return input.config
+        ? none('unknown', 'the assigned server has no listed location')
+        : none('unmanaged', 'no Bulkhead server assigned to match')
+    }
+
+    // Exit mode (default): match the real exit. Page-path evidence first — it
+    // is where pages actually surface, even when a downstream proxy routes them
+    // somewhere other than the probe, and even for unmanaged contexts.
+    if (input.foxyGeo && (input.foxyGeo.country || input.foxyGeo.city)) {
+      const d = from(input.foxyGeo, 'page')
+      if (d) return d
+    }
     if (input.geoTrusted && input.geo && (input.geo.country || input.geo.city)) {
-      // Probe geography stands alone: it is the OBSERVED exit, and mixing in
-      // the assignment's country code would let a config label override an
-      // observation — the exact inversion of what "trust the probe" means.
-      // (For relays the two agree by construction: 'up' requires the exit
-      // hostname to match the assignment. For the tunnel endpoint and custom
-      // exits the config has no geography at all.)
-      const d = zoneFromLocation({ country: input.geo.country, city: input.geo.city })
-      if (d.zone && usableZone(d.zone, input.intl)) return { zone: d.zone, source: 'probe', approx: d.approx, rule: d.rule }
+      const d = from(input.geo, 'probe')
+      if (d) return d
     }
-
-    if (input.config.city || input.config.cc || input.config.country) {
-      const d = zoneFromLocation({ country: input.config.country, city: input.config.city, cc: input.config.cc })
-      if (d.zone && usableZone(d.zone, input.intl)) return { zone: d.zone, source: 'relay', approx: d.approx, rule: d.rule }
+    if (hasConfigGeo) {
+      const d = configGeo()
+      if (d) return { zone: d.zone, source: 'relay', approx: d.approx, rule: d.rule }
     }
-
-    return none('unknown', 'exit location not known yet')
+    return input.config
+      ? none('unknown', 'exit location not known yet')
+      : none('unmanaged', 'no exit assigned to this context')
   }
 
   const api = { zoneFromLocation, canonicalZone, usableZone, derive, normStr, COUNTRY_TZ, CITY_TZ, NAME2ISO }
