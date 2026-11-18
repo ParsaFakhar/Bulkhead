@@ -252,9 +252,11 @@
       if (d.zone && usableZone(d.zone, input.intl)) return { zone: d.zone, source, approx: d.approx, rule: d.rule }
       return null
     }
-    const hasConfigGeo = Boolean(input.config && (input.config.city || input.config.cc || input.config.country))
+    const cfg = input.config
+    const hasConfigGeo = Boolean(cfg && (cfg.city || cfg.cc || cfg.country))
     const configGeo = () => {
-      const d = zoneFromLocation({ country: input.config.country, city: input.config.city, cc: input.config.cc })
+      if (!cfg) return null
+      const d = zoneFromLocation({ country: cfg.country, city: cfg.city, cc: cfg.cc })
       if (d.zone && usableZone(d.zone, input.intl)) return { zone: d.zone, approx: d.approx, rule: d.rule }
       return null
     }

@@ -232,7 +232,9 @@
   const TZ_SOURCE_TEXT = Object.assign(Object.create(null), {
     pin: 'pinned by you',
     probe: 'matched to the verified exit',
+    page: 'matched to the real exit (downstream proxy)',
     relay: 'from the assigned server (exit not verified yet)',
+    bulkhead: 'from the assigned Bulkhead server',
     off: 'off — pages here see your system zone',
     disabled: 'matching is switched off',
     unmanaged: 'no exit assigned — never spoofed',

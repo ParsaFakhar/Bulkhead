@@ -40,11 +40,17 @@
 // fail-accurate timezone oracle: the zone is known, verified and registered
 // before the first document is allowed to start.
 //
-// Unmanaged contexts are NEVER spoofed (zonelib.derive: 'unmanaged'). A zone
-// your real IP contradicts is a louder signal than an honest one; matching
-// only where the exit is controlled is the whole point. A user pin overrides
-// everything, including for unassigned contexts — with the UI saying plainly
-// that a pin without an exit is a claim the network will not back up.
+// Unmanaged contexts are never spoofed from a probe or a relay listing —
+// there is no exit of ours to match, and a zone your real IP contradicts is
+// a louder signal than an honest one. Two things still apply there: a user
+// pin (a standing instruction, with the UI saying plainly that a pin without
+// an exit is a claim the network will not back up), and — when the user says
+// a downstream proxy is ON for that context — the page-path exit lookup,
+// which measures where pages REALLY surface even when Bulkhead routes
+// nothing. In managed contexts the same lookup outranks the probe whenever
+// it is on: with FoxyProxy chaining a residential exit after Bulkhead's
+// server, the probe can answer from the server while pages leave from the
+// residential — and the zone must match the pages' exit, not the probe's.
 
 /* global zonelib, installTZRealm, log */
 
@@ -71,7 +77,9 @@
    *  @type {(id: string) => { country: string | null, city: string | null } | null} */
   let pageGeoSource = () => null
   /** @param {(id: string) => { country: string | null, city: string | null } | null} fn */
-  function setPageGeoSource (fn) { if (typeof fn === 'function') pageGeoSource = fn }
+  function setPageGeoSource (fn) {
+    if (typeof fn === 'function') pageGeoSource = fn
+  }
 
   /* ---------------------------------------------------------------- storage */
 
@@ -286,9 +294,12 @@
    */
   async function rehydrate (containers) {
     for (const id of [...registered.keys()]) {
-      if (!(id in containers) && !Object.prototype.hasOwnProperty.call(overrides, id)) await drop(id)
+      if (!(id in containers) && !Object.prototype.hasOwnProperty.call(overrides, id) && foxy[id] !== true) await drop(id)
     }
-    for (const id of Object.keys(overrides)) {
+    // Contexts we owe a derivation even without an assignment: pins, and
+    // downstream-proxy contexts whose exit is learned from the page path.
+    const extra = new Set([...Object.keys(overrides), ...Object.keys(foxy)])
+    for (const id of extra) {
       if (!(id in containers)) await sync(id, undefined).catch(() => {})
     }
     await Promise.all(Object.entries(containers).map(([id, c]) => sync(id, c).catch(() => {})))
@@ -303,8 +314,17 @@
   /* -------------------------------------------------------------- overrides */
 
   /**
-   * Store a pin ('Europe/Oslo'), 'off', or null/'auto' to clear. Validated
-   * here rather than trusting the UI: a bad string must never reach storage.
+   * Store a mode or a pin. The value domain (backward compatible with the
+   * original pin/'off' storage):
+   *   'off'       never spoof here.
+   *   'bulkhead'  match the ASSIGNED Bulkhead server's listed location only,
+   *               deliberately ignoring the real exit.
+   *   'exit'      match the real exit — the DEFAULT, stored as absence, so
+   *               'exit'/'auto'/null all clear the entry.
+   *   <zone>      a pin ('Europe/Oslo'). Outranks every lookup, and works
+   *               whether or not Bulkhead manages the context.
+   * Validated here rather than trusting the UI: a bad string must never
+   * reach storage.
    * @param {string} id
    * @param {string | null} value
    * @returns {Promise<{ ok: boolean, error?: string, zone?: string | null }>}
@@ -312,9 +332,9 @@
   async function setOverride (id, value) {
     if (typeof id !== 'string' || !id) return { ok: false, error: 'bad context' }
     let store = null
-    if (value === 'off') {
-      store = 'off'
-    } else if (typeof value === 'string' && value && value !== 'auto') {
+    if (value === 'off' || value === 'bulkhead') {
+      store = value
+    } else if (typeof value === 'string' && value && value !== 'auto' && value !== 'exit') {
       const z = zonelib.canonicalZone(value, Intl)
       if (!z) return { ok: false, error: `Not a timezone this engine knows: ${value}` }
       store = z
@@ -326,7 +346,33 @@
     // loadSettings runs on the storage.onChanged echo; do it here too so the
     // sync below cannot race the event and read the previous value.
     await loadSettings()
-    return { ok: true, zone: store === 'off' ? null : store }
+    // `zone` answers "what is pinned", so mode keywords report null.
+    return { ok: true, zone: store === 'off' || store === 'bulkhead' ? null : store }
+  }
+
+  /**
+   * [bhtz] The per-context "a downstream proxy (FoxyProxy, residential) is
+   * ON" switch. Only changes how EXIT mode learns the exit: ON => the
+   * background measures the container's actual page path (which rides the
+   * downstream proxy); OFF => the killswitch probe's exit is used. Stored
+   * separately from the mode, so it survives mode changes.
+   * @param {string} id
+   * @param {boolean} on
+   * @returns {Promise<{ ok: boolean, error?: string }>}
+   */
+  async function setFoxy (id, on) {
+    if (typeof id !== 'string' || !id) return { ok: false, error: 'bad context' }
+    const next = { ...foxy }
+    if (on === true) next[id] = true
+    else delete next[id]
+    await browser.storage.local.set({ tzFoxy: next })
+    await loadSettings()
+    return { ok: true }
+  }
+
+  /** Synchronous read for the background's lookup triggers. @param {string} id @returns {boolean} */
+  function foxyOn (id) {
+    return foxy[id] === true
   }
 
   /* ----------------------------------------------------------------- reload */
@@ -372,6 +418,7 @@
       supported: mainWorldOk,
       error: lastError,
       overrides: { ...overrides },
+      foxy: { ...foxy },
       zones: Object.fromEntries([...derived].map(([id, d]) => [id, { ...d }]))
     }
   }
@@ -488,6 +535,9 @@
     rehydrate,
     unregisterAll,
     setOverride,
+    setFoxy,
+    foxyOn,
+    setPageGeoSource,
     reloadContextTabs,
     zoneOf,
     snapshot,

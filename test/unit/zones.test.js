@@ -150,3 +150,81 @@ test('derive: nothing to work with says unknown, not UTC', () => {
   assert.equal(d.zone, null)
   assert.equal(d.source, 'unknown')
 })
+
+// -- derive(): the four modes + downstream (page-path) evidence -------------
+
+const CFG_GB = { city: 'London', country: 'United Kingdom', cc: 'gb' }
+const GEO_GB = { country: 'United Kingdom', city: 'London' }
+const GEO_CH = { country: 'Switzerland', city: 'Zurich' }
+
+test('derive: bulkhead mode matches the assignment even when the real exit differs', () => {
+  // assigned UK, verified probe says US, downstream says CH — the user
+  // asked for the SERVER's location, so the server's location it is
+  const d = derive({ enabled: true, override: 'bulkhead', geo: GEO_US, geoTrusted: true, foxyGeo: GEO_CH, config: CFG_SE, intl: Intl })
+  assert.equal(d.zone, 'Europe/Stockholm')
+  assert.equal(d.source, 'bulkhead')
+})
+
+test('derive: bulkhead mode with no assignment has nothing to match', () => {
+  const d = derive({ enabled: true, override: 'bulkhead', foxyGeo: GEO_CH, config: null, intl: Intl })
+  assert.equal(d.zone, null)
+  assert.equal(d.source, 'unmanaged')
+})
+
+test('derive: bulkhead mode with a geo-less custom exit says unknown', () => {
+  const d = derive({ enabled: true, override: 'bulkhead', config: { city: '', country: '', cc: '' }, intl: Intl })
+  assert.equal(d.zone, null)
+  assert.equal(d.source, 'unknown')
+})
+
+test('derive: the chained-residential scenario — page path beats probe and relay', () => {
+  // Firefox(NO) -> Bulkhead container(GB) -> FoxyProxy residential(CH):
+  // the probe rides the server and says GB; pages ride the chain and say
+  // CH. The zone must match where PAGES surface.
+  const d = derive({ enabled: true, geo: GEO_GB, geoTrusted: true, foxyGeo: GEO_CH, config: CFG_GB, intl: Intl })
+  assert.equal(d.zone, 'Europe/Zurich')
+  assert.equal(d.source, 'page')
+})
+
+test('derive: page-path evidence applies to unmanaged contexts too', () => {
+  // no Bulkhead assignment at all — FoxyProxy alone owns the routing
+  const d = derive({ enabled: true, foxyGeo: { country: 'Norway' }, config: null, intl: Intl })
+  assert.equal(d.zone, 'Europe/Oslo')
+  assert.equal(d.source, 'page')
+})
+
+test('derive: page-path evidence does not need the probe to be trusted', () => {
+  const d = derive({ enabled: true, geo: GEO_US, geoTrusted: false, foxyGeo: GEO_CH, config: CFG_SE, intl: Intl })
+  assert.equal(d.zone, 'Europe/Zurich')
+  assert.equal(d.source, 'page')
+})
+
+test('derive: unusable page-path geo falls through to the probe', () => {
+  const d = derive({ enabled: true, geo: GEO_US, geoTrusted: true, foxyGeo: { country: 'Atlantis', city: 'Poseidon' }, config: CFG_SE, intl: Intl })
+  assert.equal(d.zone, 'America/New_York')
+  assert.equal(d.source, 'probe')
+})
+
+test('derive: empty page-path geo is ignored', () => {
+  const d = derive({ enabled: true, geo: GEO_US, geoTrusted: true, foxyGeo: { country: null, city: null }, config: CFG_SE, intl: Intl })
+  assert.equal(d.zone, 'America/New_York')
+  assert.equal(d.source, 'probe')
+})
+
+test('derive: a pin still outranks page-path evidence', () => {
+  const d = derive({ enabled: true, override: 'Asia/Tokyo', foxyGeo: GEO_CH, config: CFG_GB, intl: Intl })
+  assert.equal(d.zone, 'Asia/Tokyo')
+  assert.equal(d.source, 'pin')
+})
+
+test('derive: off and disabled still outrank page-path evidence', () => {
+  assert.equal(derive({ enabled: true, override: 'off', foxyGeo: GEO_CH, config: CFG_GB, intl: Intl }).source, 'off')
+  assert.equal(derive({ enabled: false, foxyGeo: GEO_CH, config: CFG_GB, intl: Intl }).source, 'disabled')
+})
+
+test('derive: the exit keyword behaves exactly like the default', () => {
+  const a = derive({ enabled: true, override: 'exit', geo: GEO_US, geoTrusted: true, config: CFG_SE, intl: Intl })
+  const b = derive({ enabled: true, geo: GEO_US, geoTrusted: true, config: CFG_SE, intl: Intl })
+  assert.deepEqual(a, b)
+  assert.equal(a.source, 'probe')
+})

@@ -26,9 +26,18 @@ interface ContainerConfig {
   healthDetail?: string
   healthAt?: number
   exitIp?: string
-  /** [bhtz] country/city as the verified probe's exit reported them.
-   *  In-memory only, like health; trusted only while health is 'up'. */
+  /** [bhtz] country/city as the probe's exit reported them. In-memory only,
+   *  like health. Trusted when lastGeoVerified — the answer's ROUTE was
+   *  proven, independent of the Mullvad-only health verdict. */
   lastGeo?: { country: string | null, city: string | null, at: number } | null
+  /** [bhtz] true while the last geo answer travelled this container's own
+   *  proxy (probeTraversed). Cleared when a check is carried elsewhere. */
+  lastGeoVerified?: boolean
+  /** [bhtz] exit measured through the container's actual PAGE PATH (a
+   *  downstream proxy such as FoxyProxy + residential included). Mirror of
+   *  the background's pageGeo cache; the cache also covers unmanaged
+   *  contexts, which have no config to carry this. */
+  lastPageGeo?: { country: string | null, city: string | null, ip: string, at: number } | null
 }
 
 interface CustomExit {
@@ -191,7 +200,7 @@ interface StateSnapshot {
 
 // ---- Bulkhead TZ ----
 
-type TzSource = 'pin' | 'probe' | 'relay' | 'off' | 'disabled' | 'unmanaged' | 'unknown'
+type TzSource = 'pin' | 'probe' | 'page' | 'relay' | 'bulkhead' | 'off' | 'disabled' | 'unmanaged' | 'unknown'
 
 interface TzDerivation {
   zone: string
@@ -210,8 +219,11 @@ interface TzSnapshot {
   supported: boolean | null
   /** last registration error, '' when healthy */
   error: string
-  /** cookieStoreId -> pinned zone, or 'off' */
+  /** cookieStoreId -> mode keyword ('off' | 'bulkhead') or a pinned zone.
+   *  Absence means the default: match the real exit. */
   overrides: Record<string, string>
+  /** cookieStoreId -> "a downstream proxy (FoxyProxy) is ON here" */
+  foxy: Record<string, boolean>
   zones: Record<string, TzDerivation>
 }
 
@@ -231,6 +243,7 @@ declare var zonelib: {
     override?: string | null
     geo?: { country?: string | null, city?: string | null } | null
     geoTrusted?: boolean
+    foxyGeo?: { country?: string | null, city?: string | null } | null
     config?: { city?: string, country?: string, cc?: string } | null
     intl: typeof Intl
   }): { zone: string | null, source: TzSource, approx: boolean, rule: string }
@@ -257,6 +270,9 @@ declare var tzlib: {
   rehydrate(containers: Record<string, ContainerConfig>): Promise<void>
   unregisterAll(): Promise<void>
   setOverride(id: string, value: string | null): Promise<{ ok: boolean, error?: string, zone?: string | null }>
+  setFoxy(id: string, on: boolean): Promise<{ ok: boolean, error?: string }>
+  foxyOn(id: string): boolean
+  setPageGeoSource(fn: (id: string) => { country: string | null, city: string | null } | null): void
   reloadContextTabs(id: string): Promise<number>
   zoneOf(id: string): string
   snapshot(): TzSnapshot

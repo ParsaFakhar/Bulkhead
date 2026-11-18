@@ -176,6 +176,7 @@ async function hydrate () {
     // killswitch: a timezone failure is a feature failure, not a gate failure.
     tzlib.loadSettings()
       .then(() => tzlib.rehydrate(containers))
+      .then(() => refreshFoxyGeos())
       .catch(e => log('[bulkhead-tz] rehydrate failed:', String(e)))
   })
 }
@@ -204,13 +205,14 @@ browser.storage.onChanged.addListener((changes, area) => {
   // runs when containers changed, and sync() is idempotent, so the overlap
   // costs nothing. Switching the feature off must pull every script, which
   // rehydrate would not do for contexts that are still assigned.
-  if (changes.tzEnabled || changes.tzOverrides || changes.tzReload) {
+  if (changes.tzEnabled || changes.tzOverrides || changes.tzReload || changes.tzFoxy) {
     tzlib.loadSettings()
       .then(async () => {
         const s = await tzlib.snapshot()
         if (!s.enabled) await tzlib.unregisterAll()
         else await tzlib.rehydrate(state.containers)
         updateAllBadges()
+        if (s.enabled) refreshFoxyGeos()
       })
       .catch(e => log('[bulkhead-tz] settings reload failed:', String(e)))
   }
@@ -442,6 +444,12 @@ async function probe (id) {
     // below; a custom exit has none, so this check is what stands in for it.
     const via = probeRoute.get(token)
     if (!probeTraversed(via, c)) {
+      // [bhtz] The check did not travel this container's proxy, so whatever
+      // exit answered says nothing about where this container's pages
+      // surface. Untrust the previous geography (keep it for diagnostics);
+      // the derivation falls back to the assignment's listed location.
+      const now = state.containers[id]
+      if (now) now.lastGeoVerified = false
       // Carried by something else entirely -- another proxy in Firefox's
       // failover list, or nothing at all. That is a misroute in the plainest
       // sense, whatever the exit itself is doing, so it gets the state whose
@@ -486,6 +494,11 @@ async function probe (id) {
       // Honest evidence -- this probe travelled its own proxy -- so it also
       // ends whatever episode the recheck marker was holding open.
       rechecked.delete(id)
+      // [bhtz] The route was verified, so this IS where the container's
+      // traffic surfaces — a residential chained after the server, say.
+      // The killswitch still blocks (fail-closed: not a Mullvad exit), but
+      // the zone must match the REAL exit, so record it as trusted.
+      setGeo(id, j)
       markHealth(id, 'down', 'Traffic came out somewhere that is not a Mullvad server.')
     } else if (c.socksHost && j.mullvad_exit_ip_hostname !== c.socksHost) {
       // Answered, but from the wrong exit -- a failure either way, once it
@@ -494,6 +507,9 @@ async function probe (id) {
       if (recheck(id, key, startedAt, 'The last check came out at a different server. Checking again.')) return
       const became = relaylib.renamedTo(c, j.mullvad_exit_ip_hostname, relayMemo.relays)
       renamed[id] = became ? became.host : ''
+      // [bhtz] Verified route, wrong server: still the REAL exit, so the
+      // zone matches it while the gate blocks the container.
+      setGeo(id, j)
       markHealth(id, 'misrouted', `expected ${c.socksHost}, got ${j.mullvad_exit_ip_hostname}`)
     } else {
       delete renamed[id]
@@ -606,8 +622,9 @@ function relayStillDown () {
 // [bhtz] The probe's own geography, kept with the verdict it arrived with.
 // am.i.mullvad.net answers with the country (always) and city (often null
 // for non-Mullvad ranges) of whoever reached it — and whoever reached it
-// through a verified probe is exactly this container's exit. In-memory only,
-// like health: a restarted browser trusts nothing until a probe re-answers.
+// through a verified probe is exactly this container's exit, Mullvad or
+// not. In-memory only, like health: a restarted browser trusts nothing
+// until a probe re-answers.
 /** @param {string} id @param {{ country?: unknown, city?: unknown }} j */
 function setGeo (id, j) {
   const c = state.containers[id]
@@ -615,7 +632,151 @@ function setGeo (id, j) {
   const country = typeof j.country === 'string' && j.country ? j.country : null
   const city = typeof j.city === 'string' && j.city ? j.city : null
   c.lastGeo = country || city ? { country, city, at: Date.now() } : null
+  // Called ONLY on answers whose route was verified (probeTraversed in
+  // probe()), so the geography is trusted by ROUTE, not by the health
+  // verdict: a real non-Mullvad exit — a residential chained after the
+  // server, say — still gets its zone matched even though the fail-closed
+  // gate blocks the container. The killswitch is unchanged; only the
+  // zone's evidence standard moved from "Mullvad said up" to "the route
+  // was proven and the exit answered".
+  c.lastGeoVerified = Boolean(c.lastGeo)
 }
+
+// [bhtz] Page-path exit geography — the answer to "where do this context's
+// pages REALLY surface", which is not always where the probe surfaces: with
+// a downstream proxy (FoxyProxy chaining a residential exit after Bulkhead's
+// server), the background probe can ride the server while page requests ride
+// the whole chain. A fetch issued from a content script in one of the
+// context's own tabs travels the tab's actual path — whoever owns
+// proxy.onRequest, whatever they chain — so its answer is the exit the pages
+// use. Used only for contexts whose user said "downstream proxy is ON";
+// everything else keeps the probe as its evidence.
+const PAGE_GEO_TTL_MS = 5 * 60 * 1000
+/** @type {Map<string, { country: string | null, city: string | null, ip: string, at: number }>} */
+const pageGeo = new Map()
+/** @type {Map<string, Promise<{ country: string | null, city: string | null, ip: string, at: number } | null>>} */
+const pageGeoInFlight = new Map()
+
+// Runs in the tab's ISOLATED world. A content-script fetch with <all_urls>
+// host permission bypasses CORS and the page's CSP, carries the tab's
+// cookieStoreId, and is routed exactly like the tab's own requests — which
+// is the whole point: it measures the page path, not the background's.
+const PAGE_GEO_SOURCE = `(async () => {
+  try {
+    const res = await fetch(${JSON.stringify(PROBE_URL)}, {
+      credentials: 'omit', cache: 'no-store', referrer: 'no-referrer',
+      redirect: 'error', signal: AbortSignal.timeout(10000)
+    })
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status }
+    const j = await res.json()
+    return {
+      ok: true,
+      country: typeof j.country === 'string' && j.country ? j.country : null,
+      city: typeof j.city === 'string' && j.city ? j.city : null,
+      ip: typeof j.ip === 'string' ? j.ip : ''
+    }
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) } }
+})()`
+
+/**
+ * Ask the context's own tabs where their traffic surfaces. Tries http(s)
+ * tabs until one answers (a tab can close or navigate mid-call); at most
+ * three attempts, so a dead network costs one bounded wait, not one per tab.
+ * @param {string} id
+ * @returns {Promise<{ country: string | null, city: string | null, ip: string } | null>}
+ */
+async function lookupExitGeo (id) {
+  /** @type {browser.tabs.Tab[]} */
+  let tabs
+  try {
+    tabs = await browser.tabs.query({ cookieStoreId: id })
+  } catch {
+    return null
+  }
+  // Active tabs first: the likeliest to be a live, loaded document.
+  tabs.sort((a, b) => Number(b.active) - Number(a.active))
+  let tries = 0
+  for (const t of tabs) {
+    if (t.id === undefined || !/^https?:/i.test(t.url || '')) continue
+    if (++tries > 3) break
+    try {
+      const results = await browser.tabs.executeScript(t.id, { code: PAGE_GEO_SOURCE })
+      const r = Array.isArray(results) ? results[0] : null
+      if (r && r.ok === true && (r.country || r.city)) {
+        return { country: r.country || null, city: r.city || null, ip: r.ip || '' }
+      }
+    } catch { /* tab gone or privileged: the next tab may still answer */ }
+  }
+  return null
+}
+
+/**
+ * TTL + in-flight dedup around lookupExitGeo. On a fresh answer: cache it,
+ * mirror it onto the assignment (for the snapshot), re-derive the zone. On
+ * failure: a still-fresh last answer stands; a stale one is dropped so
+ * derive falls back to the probe's evidence instead of claiming an exit it
+ * can no longer prove.
+ * @param {string} id
+ * @param {boolean} [force] skip the TTL (an explicit user toggle)
+ */
+async function ensurePageGeo (id, force = false) {
+  if (!tzlib.snapshot().enabled || !tzlib.foxyOn(id)) return null
+  const hit = pageGeo.get(id)
+  if (!force && hit && Date.now() - hit.at < PAGE_GEO_TTL_MS) {
+    // The answer stands; make sure the registration does too (a rehydrate
+    // may have rebuilt registrations since it landed). Idempotent.
+    tzlib.sync(id, state.containers[id]).catch(e => log('[bulkhead-tz] sync failed:', String(e)))
+    return hit
+  }
+  const flying = pageGeoInFlight.get(id)
+  if (flying) return flying
+  const job = lookupExitGeo(id).then((g) => {
+    pageGeoInFlight.delete(id)
+    // The user may have switched the downstream proxy off mid-round-trip.
+    if (!tzlib.foxyOn(id)) return null
+    const now = Date.now()
+    if (g) {
+      const rec = { ...g, at: now }
+      pageGeo.set(id, rec)
+      const c = state.containers[id]
+      if (c) c.lastPageGeo = rec
+      log(`[bulkhead-tz] ${id}: page-path exit ${rec.ip || '?'} (${rec.country || '?'}${rec.city ? ', ' + rec.city : ''})`)
+      tzlib.sync(id, c).catch(e => log('[bulkhead-tz] sync failed:', String(e)))
+      updateBadgesFor(id)
+      return rec
+    }
+    const old = pageGeo.get(id)
+    if (old && now - old.at >= PAGE_GEO_TTL_MS) {
+      pageGeo.delete(id)
+      const c = state.containers[id]
+      if (c) c.lastPageGeo = null
+      tzlib.sync(id, c).catch(e => log('[bulkhead-tz] sync failed:', String(e)))
+    }
+    return old || null
+  }, (e) => {
+    pageGeoInFlight.delete(id)
+    log('[bulkhead-tz] page-path lookup failed for', id, String(e))
+    return pageGeo.get(id) || null
+  })
+  pageGeoInFlight.set(id, job)
+  return job
+}
+
+// [bhtz] Keep the downstream-proxy exit fresh for every context that asked
+// for page-path matching. Cheap: ensurePageGeo dedups and honours the TTL.
+function refreshFoxyGeos () {
+  const fx = tzlib.snapshot().foxy
+  for (const id of Object.keys(fx)) {
+    if (fx[id] === true) ensurePageGeo(id).catch(e => log('[bulkhead-tz] page-path refresh failed:', String(e)))
+  }
+}
+
+// The derivation reads the cache through this, TTL-checked, so a stale
+// answer cannot feed a sync triggered by something else (a health verdict).
+tzlib.setPageGeoSource((id) => {
+  const g = pageGeo.get(id)
+  return g && Date.now() - g.at < PAGE_GEO_TTL_MS ? { country: g.country, city: g.city } : null
+})
 
 /** @param {string} id @param {Health} health @param {string} detail @param {string} [exitIp] */
 function markHealth (id, health, detail, exitIp) {
@@ -626,11 +787,18 @@ function markHealth (id, health, detail, exitIp) {
   c.healthDetail = detail
   c.healthAt = Date.now()
   c.exitIp = health === 'up' ? (exitIp || '') : ''
-  // [bhtz] Health gates probe geography: zonelib trusts lastGeo only while
-  // the verdict is 'up', so every transition re-derives what this context's
-  // pages should present. Idempotent — an unchanged zone touches no
-  // registration — which makes one choke point cheap enough.
+  // [bhtz] Every verdict re-derives what this context's pages should
+  // present. Geography is trusted by ROUTE, not by health: setGeo marks
+  // lastGeoVerified only on answers that travelled this container's own
+  // proxy, so a real non-Mullvad exit still gets its zone matched while the
+  // gate blocks it. Idempotent — an unchanged zone touches no registration —
+  // which makes one choke point cheap enough.
   tzlib.sync(id, c).catch(e => log('[bulkhead-tz] sync failed:', String(e)))
+  // [bhtz] A confirmed exit is the first moment a page-path lookup can ride
+  // it: the gate blocks the lookup's own fetch until health is 'up'.
+  if (health === 'up' && tzlib.foxyOn(id)) {
+    ensurePageGeo(id).catch(e => log('[bulkhead-tz] page-path lookup failed:', String(e)))
+  }
   // Deliberately no notification on a verdict: relays drop on every reconnect
   // and wake, a tunnel going down takes every container with it, and the
   // badge and blocked page already say so.
@@ -685,7 +853,10 @@ browser.alarms.onAlarm.addListener((a) => {
     refreshRelays(true).catch(e => log('[bulkhead] relay refresh failed:', String(e)))
     return
   }
-  if (a.name === 'slow') checkDoh()
+  if (a.name === 'slow') {
+    checkDoh()
+    refreshFoxyGeos() // [bhtz] downstream exits drift; re-measure the page path
+  }
   if (a.name !== 'tick') return
 
   const now = Date.now()
@@ -705,6 +876,10 @@ browser.alarms.onAlarm.addListener((a) => {
   }
   for (const id of rechecked.keys()) {
     if (!(id in state.containers)) rechecked.delete(id)
+  }
+  // [bhtz] a context whose downstream switch went off keeps no exit cache
+  for (const id of pageGeo.keys()) {
+    if (!tzlib.foxyOn(id)) pageGeo.delete(id)
   }
 })
 
@@ -780,6 +955,17 @@ function badgeTab (tab) {
 
 browser.tabs.onUpdated.addListener((tabId, info, tab) => {
   if (Object.keys(state.containers).length) badgeTab(tab)
+})
+
+// [bhtz] The first page load in a downstream-proxy context is the moment to
+// learn its real exit: the lookup rides the same path the page just took.
+// TTL + in-flight dedup inside ensurePageGeo make this cheap on every tab,
+// and a cached answer changes no zone, so no reload loop can form.
+browser.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (!state.ready || !tab.cookieStoreId) return
+  if (info.status !== 'loading' || !/^https?:/i.test(tab.url || '')) return
+  if (!tzlib.foxyOn(tab.cookieStoreId)) return
+  ensurePageGeo(tab.cookieStoreId).catch(e => log('[bulkhead-tz] page-path lookup failed:', String(e)))
 })
 
 /** @param {string} id @returns {Promise<string>} */
@@ -1289,14 +1475,39 @@ browser.runtime.onMessage.addListener(async (msg, sender) => {
       return { ok: true }
     // [bhtz] timezone matching ------------------------------------------
     case 'tzOverride': {
-      // value: a zone string to pin, 'off' to never spoof here, or
-      // 'auto'/null to follow the exit again
+      // value: a zone string to pin, 'off' to never spoof here, 'bulkhead'
+      // to match the assigned server's listed location only, or
+      // 'exit'/'auto'/null to follow the real exit again (the default)
       const out = await tzlib.setOverride(String(msg.cookieStoreId || ''), typeof msg.value === 'string' ? msg.value : null)
       if (out.ok) {
         // setOverride wrote to storage, which echoes into onChanged; sync
         // directly too so the caller's refresh() cannot race the event
         await tzlib.sync(String(msg.cookieStoreId), state.containers[msg.cookieStoreId])
         updateBadgesFor(String(msg.cookieStoreId))
+      }
+      return out
+    }
+    case 'tzSetFoxy': {
+      // [bhtz] "a downstream proxy (FoxyProxy / residential) is ON here":
+      // exit mode now learns the exit from the container's actual page path
+      // instead of the background probe. Stored per context, independent of
+      // the mode, so it survives mode changes.
+      const id = String(msg.cookieStoreId || '')
+      const out = await tzlib.setFoxy(id, msg.on === true)
+      if (out.ok) {
+        if (msg.on === true) {
+          // Fire-and-forget: the lookup is a round trip through the whole
+          // chain; the caller's UI refreshes on its own and picks it up.
+          ensurePageGeo(id, true).catch(e => log('[bulkhead-tz] page-path lookup failed:', String(e)))
+        } else {
+          // Back to probe evidence: drop the page-path answer entirely so a
+          // later re-enable starts from a fresh measurement, not a memory.
+          pageGeo.delete(id)
+          const c = state.containers[id]
+          if (c) c.lastPageGeo = null
+        }
+        await tzlib.sync(id, state.containers[id])
+        updateBadgesFor(id)
       }
       return out
     }

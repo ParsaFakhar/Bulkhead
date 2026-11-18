@@ -74,6 +74,8 @@ footer {
 .tz-card .tz-glyph { font-size: 13px; opacity: 0.75; margin-right: 2px; }
 .tz-card .place { font-size: 13px; }
 .tz-card .banner { margin-top: 2px; }
+.tz-foxy { margin-top: 6px; gap: 6px; align-items: center; }
+.tz-foxy input { margin: 0; }
 
 .tz-specials { display: flex; flex-direction: column; gap: 4px; }
 .tz-search { width: 100%; margin-top: 8px; }

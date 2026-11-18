@@ -139,6 +139,8 @@ dialog .picker-list { max-height: 46vh; }
 
 /* ---- [bhtz] timezone matching ---- */
 .danger-text { color: var(--bad, #c50042); }
-.tz-override select { max-width: 170px; }
+.tz-override select { max-width: 190px; }
 .tz-override input[type="text"] { width: 190px; }
+.tz-foxy { margin-top: 6px; gap: 6px; align-items: center; }
+.tz-foxy input { margin: 0; }
 #tz-table td { vertical-align: top; }

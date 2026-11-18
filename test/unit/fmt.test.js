@@ -249,3 +249,21 @@ test('usedBy names the contexts on each host and never shows a raw id', () => {
   })
   assert.deepEqual(usedBy(new Map(), names), {})
 })
+
+test('tzSourceText names every source the derivation can report', () => {
+  const { tzSourceText } = require('../../src/ui/fmt.js')
+  assert.match(tzSourceText('pin'), /pinned by you/)
+  assert.match(tzSourceText('probe'), /verified exit/)
+  assert.match(tzSourceText('page'), /real exit/)
+  assert.match(tzSourceText('page'), /downstream proxy/)
+  assert.match(tzSourceText('bulkhead'), /assigned Bulkhead server/)
+  assert.match(tzSourceText('relay'), /assigned server/)
+  assert.match(tzSourceText('off'), /system zone/)
+  assert.match(tzSourceText('disabled'), /switched off/)
+  assert.match(tzSourceText('unmanaged'), /no exit assigned/)
+  assert.match(tzSourceText('unknown'), /not known yet/)
+  // the country-level flag rides along on any source
+  assert.match(tzSourceText('page', true), /country-level/)
+  // an unknown source is passed through, never swallowed
+  assert.equal(tzSourceText('martian'), 'martian')
+})

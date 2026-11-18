@@ -182,12 +182,21 @@
     <p class="sub">
       A container's exit IP and the timezone its pages report are two halves of one story,
       and fingerprinting scripts read both — CreepJS's timezone test derives your zone three
-      ways and compares. With matching on, every context that has an exit of its own presents
-      the IANA timezone of that exit: the zone is taken from the killswitch's own verified
-      health probe (which already rides that container's server) and mapped offline through
-      timezone-database tables. No extra request, no geo-IP service, and because a container's
-      traffic is blocked until its exit checks out, the zone is installed before the first
-      page is even allowed to load. Contexts with no exit assigned are never spoofed — a zone
+      ways and compares. Each context below picks its own source:
+      <strong>Match the exit IP</strong> (default) presents the zone of the exit the traffic
+      really uses — the killswitch's own verified probe, mapped offline through
+      timezone-database tables, no geo-IP service;
+      <strong>Match Bulkhead's server</strong> presents the assigned server's listed location
+      even when the real exit differs;
+      <strong>Pin a zone</strong> installs a manual zone whether or not Bulkhead manages the
+      context;
+      <strong>Off</strong> never injects.
+      If a downstream proxy (FoxyProxy chaining a residential exit after Bulkhead's server)
+      owns the last hop, tick <strong>downstream proxy is ON</strong> for that context: the
+      exit is then measured through the container's own page path — the same route the pages
+      take — so the zone matches the residential exit, not the server behind it. The
+      killswitch is unchanged: a managed container still blocks until its Bulkhead exit
+      checks out. Contexts with no exit and no downstream lookup are never spoofed — a zone
       your real IP contradicts is a louder signal than an honest one.
     </p>
     <label class="row setting">
@@ -218,7 +227,7 @@
     <div class="scroller">
       <table id="tz-table">
         <thead>
-          <tr><th>Context</th><th>Presented zone</th><th>Override</th></tr>
+          <tr><th>Context</th><th>Presented zone</th><th>Timezone source</th></tr>
         </thead>
         <tbody id="tz-rows"></tbody>
       </table>
@@ -236,6 +245,11 @@
         <li><strong>Country-level precision in big countries.</strong> When the exit's city is
           not in the offline table, the country's primary zone is used and the row says
           “country-level”. A pin fixes any case the table misses.</li>
+        <li><strong>Downstream lookups need an open tab.</strong> With “downstream proxy is ON”,
+          the exit is measured by a request riding one of the context's own tabs. No open tab
+          means no measurement yet — the probe's exit stands in until one loads. The first
+          page in a freshly started browser can load under that stand-in zone; turn on
+          “Reload open tabs when a matched zone changes” to have it corrected immediately.</li>
         <li><strong>Anything below JavaScript.</strong> <code>privacy.resistFingerprinting</code>
           forces UTC engine-wide and overrides this feature; if you run RFP, your matched zone
           has to be UTC to stay consistent.</li>

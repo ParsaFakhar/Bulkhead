@@ -370,6 +370,28 @@
 
   let zonesListFilled = false
 
+  // The 5-second refresh used to rebuild every row from the snapshot, which
+  // destroyed a pin input mid-typing — the "vanishing pin box" bug. Two
+  // guards now keep edits alive:
+  //   1. the periodic refresh pauses while any control in this table has
+  //      focus (tzFocusId, tracked per row below);
+  //   2. each row keeps a draft. A dirty draft (a mode picked but not yet
+  //      applied, text typed but not yet applied) renders INSTEAD of the
+  //      server state, so even an explicit refresh — another row's Apply, a
+  //      toggle — cannot wipe it. Drafts mirror the server until dirty and
+  //      are dropped once an action lands.
+  /** @type {Map<string, { mode: string, pin: string, foxy: boolean, dirty: boolean, err: string }>} */
+  const tzDrafts = new Map()
+  let tzFocusId = ''
+
+  /** @param {string | undefined} ov @returns {string} */
+  function tzModeOf (ov) {
+    if (ov === 'off') return 'off'
+    if (ov === 'bulkhead') return 'bulkhead'
+    if (typeof ov === 'string' && ov) return 'pin'
+    return 'exit'
+  }
+
   function renderTimezones () {
     if (!snapshot) return
     const tz = snapshot.tz
@@ -413,19 +435,51 @@
     }
 
     const tbody = $('tz-rows')
-    tbody.textContent = ''
     const rows = [
       { cookieStoreId: 'firefox-default', name: 'No container', colorCode: '' },
       { cookieStoreId: 'firefox-private', name: 'Private windows', colorCode: '' },
       ...identities
     ]
+    const live = new Set(rows.map(r => r.cookieStoreId))
+    for (const id of tzDrafts.keys()) {
+      if (!live.has(id)) tzDrafts.delete(id)
+    }
+    // If an explicit refresh lands while a control here is focused (another
+    // row's Apply, a toggle), put focus and caret back after the rebuild —
+    // the draft keeps the text, this keeps the typing position.
+    const active = document.activeElement
+    /** @type {{ id: string, ctl: string, start: number | null, end: number | null } | null} */
+    let restore = null
+    if (active && tbody.contains(active)) {
+      const atr = active.closest('tr')
+      const ctl = /** @type {HTMLElement} */ (active).dataset.ctl
+      if (atr && atr.dataset.tzId && ctl) {
+        const field = /** @type {HTMLInputElement} */ (active)
+        restore = { id: atr.dataset.tzId, ctl, start: field.selectionStart ?? null, end: field.selectionEnd ?? null }
+      }
+    }
+    tbody.textContent = ''
     for (const ident of rows) {
       const id = ident.cookieStoreId
       const c = snapshot.containers[id]
       const d = tz.zones[id]
       const ov = tz.overrides[id]
+      const serverFoxy = Boolean(tz.foxy && tz.foxy[id])
+
+      let draft = tzDrafts.get(id)
+      if (!draft) {
+        draft = { mode: 'exit', pin: '', foxy: false, dirty: false, err: '' }
+        tzDrafts.set(id, draft)
+      }
+      if (!draft.dirty) {
+        draft.mode = tzModeOf(ov)
+        draft.pin = draft.mode === 'pin' && typeof ov === 'string' ? ov : ''
+        draft.foxy = serverFoxy
+        draft.err = ''
+      }
 
       const tr = document.createElement('tr')
+      tr.dataset.tzId = id
 
       const nameCell = tr.insertCell()
       const nameRow = document.createElement('div')
@@ -455,9 +509,15 @@
           ? 'matching off'
           : ov === 'off'
             ? 'system zone (pinned off)'
-            : c
-              ? 'not known yet — waiting for a verified check'
-              : 'system zone (no exit assigned)'
+            : ov === 'bulkhead'
+              ? c
+                ? 'waiting for the assigned server’s location'
+                : 'no Bulkhead server assigned to match'
+              : c
+                ? 'not known yet — waiting for a verified check'
+                : serverFoxy
+                  ? 'waiting for a page-path lookup — open a tab in this context'
+                  : 'system zone (no exit assigned)'
         zoneCell.append(none)
       }
 
@@ -466,60 +526,150 @@
       wrap.className = 'row wrap tz-override'
 
       const sel = document.createElement('select')
-      sel.setAttribute('aria-label', `Timezone override for ${ident.name}`)
-      for (const [value, label] of [['auto', 'Match the exit'], ['off', 'Off — system zone'], ['pin', 'Pin a zone…']]) {
+      sel.dataset.ctl = 'mode'
+      sel.setAttribute('aria-label', `Timezone source for ${ident.name}`)
+      for (const [value, label] of [
+        ['exit', 'Match the exit IP (default)'],
+        ['bulkhead', 'Match Bulkhead’s server'],
+        ['pin', 'Pin a zone…'],
+        ['off', 'Off — system zone']
+      ]) {
         const o = document.createElement('option')
         o.value = value
         o.textContent = label
         sel.append(o)
       }
-      sel.value = ov === 'off' ? 'off' : typeof ov === 'string' ? 'pin' : 'auto'
+      sel.value = draft.mode
 
       const input = document.createElement('input')
       input.type = 'text'
+      input.dataset.ctl = 'pin'
       input.setAttribute('list', 'tz-zones')
       input.placeholder = 'Europe/Oslo'
       input.setAttribute('aria-label', `Pinned zone for ${ident.name}`)
-      input.value = typeof ov === 'string' && ov !== 'off' ? ov : ''
-      input.hidden = sel.value !== 'pin'
+      input.value = draft.pin
+      input.hidden = draft.mode !== 'pin'
 
       const apply = document.createElement('button')
+      apply.dataset.ctl = 'apply'
       apply.textContent = 'Apply'
-      apply.hidden = sel.value !== 'pin'
+      apply.hidden = draft.mode !== 'pin'
 
       const err = document.createElement('span')
       err.className = 'sub danger-text'
+      err.textContent = draft.err
+
+      // Focus tracking: while any control in this row holds focus, the
+      // periodic refresh stands down (see the setInterval at the bottom).
+      wrap.addEventListener('focusin', () => {
+        tzFocusId = id
+      })
+      wrap.addEventListener('focusout', (e) => {
+        const to = /** @type {Node | null} */ (e.relatedTarget)
+        if (tzFocusId === id && (!to || !wrap.contains(to))) {
+          tzFocusId = ''
+        }
+      })
 
       sel.addEventListener('change', async () => {
+        draft.err = ''
         err.textContent = ''
+        draft.mode = sel.value
         input.hidden = sel.value !== 'pin'
         apply.hidden = sel.value !== 'pin'
         if (sel.value === 'pin') {
+          // Nothing is stored until Apply; the draft keeps the box open.
+          draft.dirty = true
           input.focus()
           return
         }
-        await browser.runtime.sendMessage({ cmd: 'tzOverride', cookieStoreId: id, value: sel.value })
+        draft.dirty = false
+        const out = await browser.runtime.sendMessage({ cmd: 'tzOverride', cookieStoreId: id, value: sel.value })
+        if (!out || !out.ok) {
+          draft.dirty = true
+          draft.err = (out && out.error) || 'Rejected.'
+          err.textContent = draft.err
+          return
+        }
+        tzDrafts.delete(id)
         await refresh()
       })
+      input.addEventListener('input', () => {
+        draft.dirty = true
+        draft.pin = input.value
+      })
       apply.addEventListener('click', async () => {
+        draft.err = ''
         err.textContent = ''
         const value = input.value.trim()
         if (!value) {
-          err.textContent = 'Type a zone first.'
+          draft.dirty = true
+          draft.err = 'Type a zone first.'
+          err.textContent = draft.err
           return
         }
         const out = await browser.runtime.sendMessage({ cmd: 'tzOverride', cookieStoreId: id, value })
-        if (!out.ok) {
-          err.textContent = out.error || 'Rejected.'
+        if (!out || !out.ok) {
+          draft.dirty = true
+          draft.err = (out && out.error) || 'Rejected.'
+          err.textContent = draft.err
           return
         }
+        tzDrafts.delete(id)
         await refresh()
       })
 
       wrap.append(sel, input, apply, err)
-      ovrCell.append(wrap)
+
+      // The downstream-proxy switch: only changes how EXIT mode learns the
+      // exit, so it is stored independently and survives mode changes.
+      const foxyLabel = document.createElement('label')
+      foxyLabel.className = 'row tz-foxy'
+      foxyLabel.title = 'Only affects “Match the exit IP”. ON: the exit is measured through this context’s own page path, which rides the downstream proxy (FoxyProxy / residential). OFF: the killswitch probe’s exit is used.'
+      const foxyBox = document.createElement('input')
+      foxyBox.type = 'checkbox'
+      foxyBox.dataset.ctl = 'foxy'
+      foxyBox.checked = draft.foxy
+      foxyBox.setAttribute('aria-label', `Downstream proxy is ON for ${ident.name}`)
+      const foxyText = document.createElement('span')
+      foxyText.className = 'sub'
+      foxyText.textContent = 'Downstream proxy (FoxyProxy) is ON'
+      foxyBox.addEventListener('change', async () => {
+        const on = foxyBox.checked
+        draft.foxy = on
+        const out = await browser.runtime.sendMessage({ cmd: 'tzSetFoxy', cookieStoreId: id, on })
+        if (!out || !out.ok) {
+          draft.foxy = !on
+          foxyBox.checked = !on
+          draft.err = (out && out.error) || 'Rejected.'
+          err.textContent = draft.err
+          return
+        }
+        await refresh()
+      })
+      foxyLabel.append(foxyBox, foxyText)
+
+      const col = document.createElement('div')
+      col.append(wrap, foxyLabel)
+      ovrCell.append(col)
       tbody.append(tr)
     }
+    if (restore) {
+      const el = /** @type {HTMLElement | null} */ (tbody.querySelector(`tr[data-tz-id="${restore.id}"] [data-ctl="${restore.ctl}"]`))
+      if (el && !el.hidden) {
+        el.focus()
+        if (restore.start !== null && el instanceof HTMLInputElement) {
+          try {
+            el.setSelectionRange(restore.start, restore.end ?? restore.start)
+          } catch { /* not a text field after all */ }
+        }
+      }
+    }
+    // An explicit refresh just rebuilt the rows. If the focused control was
+    // in one of them and could not be restored, it is gone now, so the
+    // periodic pause ends with it — otherwise a stale tzFocusId would hold
+    // the refresh down forever.
+    if (tzFocusId && !tbody.contains(document.activeElement)) tzFocusId = ''
   }
 
   $('recheck-all').addEventListener('click', async () => {
@@ -843,6 +993,10 @@
 
   refresh().then(renderHardening).catch(refreshFailed)
   setInterval(() => {
-    if (!dialog.open) refresh().catch(refreshFailed)
+    // [bhtz] stand down while a timezone control is being edited: rebuilding
+    // the table would destroy the pin input mid-typing. tzFocusId is cleared
+    // by focusout and by renderTimezones itself when an explicit refresh
+    // rebuilds the focused row, so this cannot latch.
+    if (!dialog.open && !tzFocusId) refresh().catch(refreshFailed)
   }, 5000)
 })()

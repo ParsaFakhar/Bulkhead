@@ -349,7 +349,13 @@
     actions.className = 'row wrap'
     const pin = document.createElement('button')
     pin.className = 'quiet'
-    pin.textContent = d && d.source === 'pin' ? 'Change pin…' : ov === 'off' ? 'Pinned off…' : 'Pin zone…'
+    pin.textContent = d && d.source === 'pin'
+      ? 'Change pin…'
+      : ov === 'off'
+        ? 'Pinned off…'
+        : ov === 'bulkhead'
+          ? 'Bulkhead server…'
+          : 'Pin zone…'
     pin.addEventListener('click', () => openZonePicker())
     const verify = document.createElement('button')
     verify.className = 'quiet'
@@ -358,6 +364,30 @@
     verify.addEventListener('click', () => openVerify())
     actions.append(pin, verify)
     card.append(actions)
+
+    // [bhtz] The downstream-proxy switch, where the user already is when
+    // they turn a residential on. Only changes how "Match the exit" learns
+    // the exit; the full explanation lives in the options page.
+    const foxyLabel = document.createElement('label')
+    foxyLabel.className = 'row tz-foxy'
+    foxyLabel.title = 'Only affects “Match the exit IP”. ON: measure the exit through this context’s own page path (rides FoxyProxy / the residential). OFF: use the killswitch probe’s exit.'
+    const foxyBox = document.createElement('input')
+    foxyBox.type = 'checkbox'
+    foxyBox.checked = Boolean(tz.foxy && tz.foxy[cookieStoreId])
+    const foxyText = document.createElement('span')
+    foxyText.className = 'sub'
+    foxyText.textContent = 'Downstream proxy (FoxyProxy) is ON'
+    foxyBox.addEventListener('change', async () => {
+      const on = foxyBox.checked
+      foxyBox.disabled = true
+      const out = await browser.runtime.sendMessage({ cmd: 'tzSetFoxy', cookieStoreId, on })
+        .catch(() => ({ ok: false }))
+      if (!out || !out.ok) foxyBox.checked = !on
+      foxyBox.disabled = false
+      await refresh()
+    })
+    foxyLabel.append(foxyBox, foxyText)
+    card.append(foxyLabel)
 
     view.append(card)
   }
@@ -388,7 +418,7 @@
 
     const note = document.createElement('p')
     note.className = 'sub'
-    note.textContent = 'Pins stand until you clear them and outrank every lookup. A pin on a context with no exit of its own is a claim the network will not back up — sites see your real IP with it.'
+    note.textContent = '“Match the exit IP” follows the real exit — tick “downstream proxy is ON” below the card when FoxyProxy chains a residential after Bulkhead. “Match Bulkhead’s server” uses the assigned server’s listed location even when the real exit differs. Pins stand until you clear them and outrank every lookup; a pin on a context with no exit of its own is a claim the network will not back up — sites see your real IP with it.'
     view.append(note)
 
     /** @param {string} label @param {string | null} sub @param {string} value @param {boolean} isCurrent */
@@ -418,7 +448,8 @@
     const specials = document.createElement('div')
     specials.className = 'tz-specials'
     specials.append(
-      mk('Match the exit', 'auto', 'auto', current === undefined && Boolean(d)),
+      mk('Match the exit IP', 'default', 'auto', (current === undefined || current === 'exit') && Boolean(d)),
+      mk('Match Bulkhead’s server', 'ignore the real exit', 'bulkhead', current === 'bulkhead'),
       mk('Off — system zone', 'never spoof here', 'off', current === 'off')
     )
     view.append(specials)
@@ -443,7 +474,7 @@
     } catch {
       zones = []
     }
-    const pinned = typeof current === 'string' && current !== 'off' ? current : null
+    const pinned = typeof current === 'string' && current !== 'off' && current !== 'bulkhead' && current !== 'exit' ? current : null
 
     function renderList () {
       const q = search.value.trim().toLowerCase().replace(/_/g, ' ')
