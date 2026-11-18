@@ -203,14 +203,15 @@ browser.storage.onChanged.addListener((changes, area) => {
   // [bhtz] The timezone settings changed underneath us — including from our
   // own setOverride(). Re-read and re-derive; hydrate()'s own rehydrate also
   // runs when containers changed, and sync() is idempotent, so the overlap
-  // costs nothing. Switching the feature off must pull every script, which
-  // rehydrate would not do for contexts that are still assigned.
+  // costs nothing. derive() owns the precedence even here: with matching
+  // disabled every context reports 'disabled' and unregisters — except a
+  // pin, which is a standing instruction and survives the global switch
+  // (the same rule the startup rehydrate already applies).
   if (changes.tzEnabled || changes.tzOverrides || changes.tzReload || changes.tzFoxy) {
     tzlib.loadSettings()
       .then(async () => {
         const s = await tzlib.snapshot()
-        if (!s.enabled) await tzlib.unregisterAll()
-        else await tzlib.rehydrate(state.containers)
+        await tzlib.rehydrate(state.containers)
         updateAllBadges()
         if (s.enabled) refreshFoxyGeos()
       })

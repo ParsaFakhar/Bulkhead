@@ -268,7 +268,6 @@ declare var tzlib: {
   sync(id: string, config: ContainerConfig | undefined): Promise<{ zone: string | null, source: string, changed: boolean }>
   drop(id: string): Promise<void>
   rehydrate(containers: Record<string, ContainerConfig>): Promise<void>
-  unregisterAll(): Promise<void>
   setOverride(id: string, value: string | null): Promise<{ ok: boolean, error?: string, zone?: string | null }>
   setFoxy(id: string, on: boolean): Promise<{ ok: boolean, error?: string }>
   foxyOn(id: string): boolean

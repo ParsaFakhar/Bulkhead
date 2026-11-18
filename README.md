@@ -3,7 +3,8 @@
 Fail-closed SOCKS5 proxies for Firefox containers — **plus per-container
 timezone matching**. Every container gets its own Mullvad exit, traffic is
 blocked whenever that exit is not confirmed working, *and* the pages inside
-each container present the IANA timezone of the exit they are proven to use —
+each container present the IANA timezone of the exit they are proven to use
+(or a per-context source you choose: the assigned server, a manual pin, off) —
 consistently enough to defeat derived-timezone fingerprinting
 ([CreepJS's timezone test](https://abrahamjuliot.github.io/creepjs/tests/timezone.html)
 included).
@@ -38,15 +39,46 @@ userscript cannot control, every one of which disappears inside Bulkhead:
 
 ## What timezone matching does
 
-For every context (container, default, private) that has an exit assigned:
+Every context (container, default, private) picks its own timezone source —
+the **Timezone source** select, per row on the settings page (and in the
+popup's picker):
 
-1. **Derive.** The verified probe's country/city → IANA zone, offline
-   (`src/zones.js`): single-zone countries resolve on the country alone;
-   multi-zone countries on the city, accepted only if tzdb lists that zone
-   inside that country; otherwise the country's primary zone, flagged
-   *country-level* in the UI. A user **pin** outranks everything; **off**
-   never spoofs; unassigned contexts are **never spoofed** — a zone your
-   real IP contradicts is a louder signal than an honest one.
+| Mode | What pages in that context present |
+|---|---|
+| **Match the exit IP** (default) | The zone of the exit the traffic *really* uses: the killswitch's own route-verified probe, mapped offline. With the downstream switch (below) the exit is measured through the context's own page path instead — which also works for contexts Bulkhead does not manage. |
+| **Match Bulkhead's server** | The assigned server's *listed* location, deliberately ignoring the real exit. No assignment ⇒ nothing to match. |
+| **Pin a zone…** | A manual IANA zone, whether or not Bulkhead manages the context — an unmanaged container can present `Europe/Oslo` while its IP says nothing of the sort. A pin is a standing instruction: it outranks every lookup and survives the global matching switch (per-context **Off** is how you stop it). The UI says plainly when a pin has no exit to back it up. |
+| **Off — system zone** | Never injects; pages keep the machine's real zone. |
+
+Contexts with no exit, no pin and no downstream measurement are still
+**never spoofed** — a zone your real IP contradicts is a louder signal than
+an honest one.
+
+**Downstream proxy (FoxyProxy) is ON.** When a downstream proxy owns the
+last hop — e.g. Firefox → Bulkhead's Mullvad server (UK) → FoxyProxy's
+residential exit (Switzerland) — the probe can answer from the Bulkhead
+server while pages surface from the residential IP. Ticking this per-context
+switch makes exit mode measure the exit through the context's **own page
+path** (a fetch riding one of its tabs, routed exactly like the tab's own
+requests), so the zone matches the residential exit — Switzerland in the
+example — not the server behind it. Re-measured on tab activity, cached at
+most five minutes. The switch only changes how exit mode learns the exit;
+it is stored separately and survives mode changes. The killswitch is
+untouched: a managed container still blocks until its Bulkhead exit checks
+out. **For downstream setups, turn on reload-on-change** (below): the first
+page after a browser start can load before the first page-path measurement
+lands, and the reload applies the corrected zone immediately.
+
+Whatever the mode, the pipeline is the same:
+
+1. **Derive.** Country/city → IANA zone, offline (`src/zones.js`):
+   single-zone countries resolve on the country alone; multi-zone countries
+   on the city, accepted only if tzdb lists that zone inside that country;
+   otherwise the country's primary zone, flagged *country-level* in the UI.
+   Precedence, highest first: per-context **off** → **pin** → the global
+   switch → **bulkhead** mode → exit mode (page-path evidence, then the
+   verified probe, then the assignment's listed location as a pre-probe
+   stand-in).
 2. **Deliver.** One MAIN-world `document_start` registration per context
    (`cookieStoreId`-filtered), the zone baked into the registered code
    (`src/tz.js`).
@@ -93,15 +125,17 @@ CreepJS derives, rather than reads, and compares derivations:
   The deep-stealth disguise covers the probe realm (see above).
 
 The popup's **Verify** button replays exactly these derivations against the
-live page (through the Xray view of the page realm) and reports each one.
+live page — *in the page's own realm*, through the isolated world's
+`wrappedJSObject.eval` bridge, so it measures what the page measures rather
+than an Xray approximation of it — and reports each one.
 
 ## Install (Firefox Nightly, macOS)
 
 Unsigned forks load as temporary add-ons — fine for a personal build, gone
 after browser restart, re-added in two clicks:
 
-1. Build: `npm ci && npm run build` → `dist/bulkhead-tz-1.1.0.zip`, or use
-   the provided `bulkhead-tz.xpi` (it is the same zip of `src/`).
+1. Build: `npm ci && npm run build` → `dist/bulkhead_tz-1.1.0.zip` (a plain
+   zip of `src/`; rename it to `.xpi` if you prefer — Firefox loads either).
 2. Nightly → `about:debugging#/runtime/this-firefox` → **Load Temporary
    Add-on…** → pick the `.xpi`/`.zip` (or `src/manifest.json`).
 3. Set the two `about:config` prefs the setup card asks for
@@ -109,7 +143,10 @@ after browser restart, re-added in two clicks:
    killswitch's own requirements, unchanged.
 4. Assign servers to your containers as in Bulkhead. Timezone matching is on
    by default and needs no configuration: the first verified probe fixes each
-   container's zone.
+   container's zone. If a downstream proxy (FoxyProxy / residential) owns the
+   last hop for some contexts, set their **Timezone source** and tick
+   **Downstream proxy (FoxyProxy) is ON** on the settings page — and turn on
+   reload-on-change while you are there.
 
 For a permanent install, either set `xpinstall.signatures.required = false`
 in Nightly and install the xpi, or run `web-ext run` from the repo
@@ -123,14 +160,19 @@ in Nightly and install the xpi, or run `web-ext run` from the repo
 
 - **Popup** (managed context): the timezone card shows the presented zone
   and its provenance (*matched to the verified exit*, *from the assigned
-  server*, *pinned by you*, *country-level* …). **Pin zone…** opens a
-  searchable zone list (Auto / Off / any ICU zone); after a pin change the
+  server*, *matched to the real exit (downstream proxy)*, *pinned by you*,
+  *country-level* …).
+  **Pin zone…** opens a searchable picker with all four modes (match the
+  exit / match Bulkhead's server / any ICU zone / off); after a change the
   popup offers to reload the context's open tabs, since a registration only
   reaches new documents. **Verify** reads the live page realm and replays
   the CreepJS derivations, line by line, with ✓/✗ per invariant.
-- **Settings page → Timezone matching**: the global switch, the
-  reload-on-change switch, a per-context table (presented zone, provenance,
-  override), and an honest list of what the feature cannot do.
+- **Settings page → Timezone matching**: the global switch (stops automatic
+  matching; explicit pins stand), the reload-on-change switch — recommended
+  for downstream-proxy setups — and a per-context table: presented zone,
+  provenance, the four-mode **Timezone source** select with a pin field, and
+  the **Downstream proxy (FoxyProxy) is ON** tick. An honest list of what
+  the feature cannot do sits below the table.
 - **Badge tooltip**: `Protected — se-got-wg-001, Gothenburg · Europe/Stockholm · checked 2m ago`.
 
 ## Limitations — read before trusting this
@@ -164,6 +206,13 @@ still applies to the networking half. For the timezone half:
   it, this feature reports itself unavailable (popup/settings banner) rather
   than degrading to an isolated-world half-patch that would fail lie
   detection while looking installed. The killswitch is unaffected either way.
+- **Downstream lookups need an open tab.** With *downstream proxy is ON*,
+  the exit is measured by a request riding one of the context's own tabs
+  (cached at most five minutes, re-measured on tab activity). No open tab
+  means no measurement yet — the probe's exit stands in, and an unmanaged
+  context stays honest, until one loads. The first page in a freshly
+  started browser can load under that stand-in zone; turn on *reload open
+  tabs when a matched zone changes* to have it corrected immediately.
 - **Existing documents keep their zone.** A registration reaches new
   documents; after a server switch or a pin change, open tabs run the old
   zone until reloaded (offered in the popup; automatable via the
@@ -176,9 +225,10 @@ still applies to the networking half. For the timezone half:
 
 ```
 npm ci
-npm test          # 100 unit tests: decide, relays, fmt, zones, and the
-                  # realm engine run end-to-end in node:vm with CreepJS's
-                  # own derivations as the assertions
+npm test          # 145 unit tests: decide, relays, fmt, zones, the mode/foxy
+                  # wiring, rehydrate + page-geo regression guards, the Verify
+                  # probe, and the realm engine run end-to-end in node:vm with
+                  # CreepJS's own derivations as the assertions
 npm run lint      # eslint, upstream config (tz-realm.js exempt as vendored)
 npm run typecheck # tsc --strict over src + types (same exemption)
 npm run lint:amo  # addons-linter at upstream's 0/0/0 bar
@@ -202,13 +252,15 @@ Gecko upstream; the suite proves the *port* is faithful.
 src/zones.js      pure geography: country/city → IANA zone + derive() precedence
 src/tz-realm.js   the page-realm engine (ported verbatim; lint/tsc-exempt)
 src/tz.js         delivery: contentScripts registration lifecycle, payload,
-                  overrides, verify source
-src/background.js [bhtz] hooks only: probe geo capture, markHealth sync,
-                  hydrate rehydrate, storage events, badge title, getState,
-                  4 RPC commands — decide()/gate/router untouched
-src/popup/*       timezone card, pin picker, verify view
-src/options/*     Timezone matching card
-test/unit/zones.test.js, test/unit/tz-realm.test.js
+                  modes/pins/foxy overrides, rehydrate, verify source
+src/background.js [bhtz] hooks only: probe geo capture, page-path exit lookup,
+                  markHealth sync, hydrate rehydrate, storage events, badge
+                  title, getState, 6 RPC commands — decide()/gate/router
+                  untouched
+src/popup/*       timezone card, mode/pin picker, verify view
+src/options/*     Timezone matching card (four-mode table, downstream switch)
+test/unit/zones.test.js, tz-realm.test.js, tz-modes.test.js, tz-verify.test.js,
+          tz-rehydrate.test.js, tz-pagegeo.test.js
 ```
 
 ## Attribution and license

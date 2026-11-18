@@ -118,6 +118,20 @@ test('derive: globally disabled beats probe geography', () => {
   assert.equal(d.source, 'disabled')
 })
 
+test('derive: a pin is a standing instruction and survives the global switch', () => {
+  // documented precedence: override zone ranks ABOVE global disabled — the
+  // switch stops automatic matching, an explicit pin is not matching. The
+  // wiring must not flap: toggle-off used to pull the pin's script, then the
+  // next probe verdict re-registered it.
+  const d = derive({ enabled: false, override: 'Asia/Tokyo', config: CFG_SE, intl: Intl })
+  assert.equal(d.zone, 'Asia/Tokyo')
+  assert.equal(d.source, 'pin')
+  // but downstream evidence is matching, and stops with the switch
+  const f = derive({ enabled: false, foxyGeo: GEO_US, config: null, intl: Intl })
+  assert.equal(f.zone, null)
+  assert.equal(f.source, 'disabled')
+})
+
 test('derive: unmanaged contexts are never spoofed', () => {
   const d = derive({ enabled: true, config: null, intl: Intl })
   assert.equal(d.zone, null)

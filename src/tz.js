@@ -305,12 +305,6 @@
     await Promise.all(Object.entries(containers).map(([id, c]) => sync(id, c).catch(() => {})))
   }
 
-  /** Called when the feature is switched off globally: pull every script. */
-  async function unregisterAll () {
-    await Promise.all([...registered.keys()].map(id => unregisterZone(id)))
-    derived.clear()
-  }
-
   /* -------------------------------------------------------------- overrides */
 
   /**
@@ -533,7 +527,6 @@
     sync,
     drop,
     rehydrate,
-    unregisterAll,
     setOverride,
     setFoxy,
     foxyOn,
